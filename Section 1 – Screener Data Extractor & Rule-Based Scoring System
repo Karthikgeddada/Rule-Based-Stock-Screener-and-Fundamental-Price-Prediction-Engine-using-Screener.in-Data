@@ -1,0 +1,521 @@
+# ====================================================
+# COMPLETE: Screener extractor + resolver + scoring + percentage
+# Paste entire block into Colab and run
+# ====================================================
+
+# install deps (Colab)
+!pip install -q requests beautifulsoup4 pandas lxml
+
+import requests, re, io, json, math
+from bs4 import BeautifulSoup, NavigableString
+import pandas as pd
+import numpy as np
+from collections import defaultdict
+
+# HTTP session
+session = requests.Session()
+session.headers.update({
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
+})
+
+# ---------------- Robust clean_num ----------------
+def clean_num(x):
+    """Convert scraped text to float (crores kept as float), handle %, ranges, missing tokens."""
+    if x is None:
+        return None
+    s = str(x).strip()
+    if not s:
+        return None
+    if s.lower() in ["-", "--", "na", "n/a", "none", ""]:
+        return None
+    # remove currency symbol but keep 'cr'
+    s = s.replace("₹", "").replace("\u20b9", "").strip()
+    # Crores detection
+    m = re.search(r"([0-9.,]+)\s*cr", s, re.I)
+    if m:
+        num = re.sub(r"[^\d.\-]","", m.group(1))
+        return float(num) if num != "" else None
+    # Percent values
+    if "%" in s:
+        s2 = s.replace("%","").replace(",","").strip()
+        if s2 == "" or s2.lower() in ["-", "--", "na", "n/a"]:
+            return None
+        try:
+            return float(re.sub(r"[^\d.\-]","", s2))
+        except:
+            return None
+    # Range like "1312 / 1055"
+    if "/" in s:
+        parts=[]
+        for part in s.split("/"):
+            p = re.sub(r"[^\d.\-]","", part.strip())
+            if p == "":
+                parts.append(None)
+            else:
+                try: parts.append(float(p))
+                except: parts.append(None)
+        return parts
+    # Normal number
+    s_num = re.sub(r"[^\d.\-]","", s)
+    if s_num == "":
+        return None
+    try:
+        return float(s_num)
+    except:
+        return None
+
+# ---------------- label → value helpers ----------------
+def _ensure_el(node):
+    if isinstance(node, NavigableString):
+        return node.parent
+    return node
+
+def _near_val(node):
+    el = _ensure_el(node)
+    if el is None: return None
+    for sel in [".value",".stat-value",".stat-num",".number",".price","span.value"]:
+        v = el.select_one(sel)
+        if v and v.text.strip(): return v.text.strip()
+    sib = el.find_next_sibling()
+    if sib and sib.text.strip(): return sib.text.strip()
+    return None
+
+def get_val(soup, label):
+    nodes = soup.find_all(string=re.compile(r"^\s*"+re.escape(label)+r"\s*$", re.I))
+    if not nodes:
+        nodes = soup.find_all(string=re.compile(re.escape(label), re.I))
+    for n in nodes:
+        v = _near_val(n)
+        if v: return v
+    return None
+
+# ---------------- extract summary & tables ----------------
+def extract_summary(company):
+    url=f"https://www.screener.in/company/{company}/"
+    r=session.get(url)
+    soup=BeautifulSoup(r.text,"lxml")
+    title=soup.select_one("h1")
+    cname = title.text.strip() if title else company
+
+    market_cap = clean_num(get_val(soup,"Market Cap"))
+    current_price = clean_num(get_val(soup,"Current Price") or get_val(soup,"Price"))
+    high_low = get_val(soup,"High / Low") or get_val(soup,"52W")
+    stock_pe = clean_num(get_val(soup,"Stock P/E") or get_val(soup,"PE"))
+    book_value = clean_num(get_val(soup,"Book Value"))
+    div_y = clean_num(get_val(soup,"Dividend Yield"))
+    roce = clean_num(get_val(soup,"ROCE"))
+    roe = clean_num(get_val(soup,"ROE"))
+    fv = clean_num(get_val(soup,"Face Value"))
+
+    hi,lo = None,None
+    if isinstance(high_low,str) and "/" in high_low:
+        hi,lo=[clean_num(x) for x in high_low.split("/")]
+
+    summary = {
+        "company_name": cname,
+        "market_cap": market_cap,
+        "current_price": current_price,
+        "52w_high": hi,
+        "52w_low": lo,
+        "stock_pe": stock_pe,
+        "book_value": book_value,
+        "dividend_yield_pct": div_y,
+        "roce_pct": roce,
+        "roe_pct": roe,
+        "face_value": fv
+    }
+    return summary, soup
+
+def get_tables(html):
+    try:
+        return pd.read_html(io.StringIO(html))
+    except:
+        dfs=[]
+        soup=BeautifulSoup(html,"lxml")
+        for t in soup.find_all("table"):
+            try:
+                part=pd.read_html(io.StringIO(str(t)))
+                dfs.extend(part)
+            except:
+                pass
+        return dfs
+
+def extract_all_tables(company):
+    base=f"https://www.screener.in/company/{company}/"
+    pages={
+        "main":base,
+        "quarters":base+"quarters/",
+        "profit_loss":base+"profit-loss/",
+        "balance_sheet":base+"balance-sheet/",
+        "cash_flow":base+"cash-flow/",
+        "shareholding":base+"shareholding-pattern/",
+        "ratios":base+"ratios/",
+        "analysis":base+"analysis/",
+        "peers":base+"peers/",
+        "segments":base+"segments/"
+    }
+    out={}
+    for k,u in pages.items():
+        r=session.get(u)
+        out[k]=get_tables(r.text)
+    return out
+
+def extract_everything(company):
+    summary, soup = extract_summary(company)
+    tables = extract_all_tables(company)
+
+    about = soup.select_one(".about .company-profile")
+    about_text = about.text.strip() if about else ""
+    key_points=[li.text.strip() for li in soup.select(".about .company-profile ul li")]
+    all_links={a.text.strip():a["href"] for a in soup.find_all("a",href=True) if a.text.strip()}
+
+    kv={}
+    for item in soup.find_all(["span","div","td"]):
+        txt=item.get_text(" ",strip=True)
+        if ":" in txt:
+            k,v=txt.split(":",1)
+            kv[k.strip()]=v.strip()
+
+    scripts=[]
+    for sc in soup.find_all("script"):
+        t = sc.string or "".join(sc.strings)
+        if t and any(x in t.lower() for x in ["chart","data","series","labels"]):
+            scripts.append(t[:3000])
+
+    return {
+        "summary": summary,
+        "about": about_text,
+        "key_points": key_points,
+        "links": all_links,
+        "tables": tables,
+        "flat_kv": kv,
+        "scripts": scripts
+    }
+
+# ---------------- Resolver ----------------
+def resolve_company_key(user_input):
+    key = user_input.strip()
+    # direct try
+    url1 = f"https://www.screener.in/company/{key}/"
+    r1 = session.get(url1)
+    if "Market Cap" in r1.text or "<title>" in r1.text:
+        return key, True
+    # numeric -> BSE code
+    if key.isdigit():
+        url2 = f"https://www.screener.in/company/{key}/"
+        r2 = session.get(url2)
+        if "Market Cap" in r2.text:
+            return key, True
+    # screener autocomplete
+    try:
+        search_url = f"https://www.screener.in/api/company/search/?q={key}"
+        r3 = session.get(search_url, timeout=8)
+        j = r3.json() if r3.status_code==200 else []
+        if len(j) > 0:
+            slug = j[0].get("slug")
+            if slug:
+                url3 = f"https://www.screener.in/company/{slug}/"
+                r4 = session.get(url3)
+                if "Market Cap" in r4.text:
+                    return slug.upper(), True
+    except:
+        pass
+    return key, False
+
+# ---------------- Robust table search helpers ----------------
+def to_float_safe(x):
+    if x is None: return None
+    try:
+        s = str(x).strip()
+        if s == "" or s.lower() in ['nan','none','-','--']: return None
+        if s.endswith('%'):
+            return float(s.replace('%','').replace(',','').strip())
+        s2 = re.sub(r"[^\d\.\-]","",s)
+        if s2 == "": return None
+        return float(s2)
+    except:
+        return None
+
+def search_row_in_table(tbl, keywords):
+    try:
+        df = pd.DataFrame(tbl)
+        first_col = df.columns[0]
+        idxs = [str(x).strip() for x in df[first_col].astype(str).tolist()]
+        for kw in keywords:
+            for i,label in enumerate(idxs):
+                if kw.lower() in label.lower():
+                    val = df.iloc[i, -1]
+                    return to_float_safe(val)
+    except:
+        pass
+    return None
+
+def search_cell_in_table(tbl, keywords):
+    try:
+        df = pd.DataFrame(tbl).astype(str)
+        flat = df.apply(lambda row: " | ".join(row.values), axis=1).tolist()
+        for row_txt in flat:
+            for kw in keywords:
+                if kw.lower() in row_txt.lower():
+                    nums = re.findall(r"[-+]?\d[\d,\.]*%?", row_txt)
+                    if nums:
+                        return to_float_safe(nums[-1])
+    except:
+        pass
+    return None
+
+def search_all_tables_for(keys_list, data_tables):
+    tables = data_tables.get("tables", {}) if isinstance(data_tables, dict) else data.get("tables", {})
+    for page, tbls in tables.items():
+        for t in (tbls or []):
+            val = search_row_in_table(t, keys_list)
+            if val is not None:
+                return val
+            val = search_cell_in_table(t, keys_list)
+            if val is not None:
+                return val
+    return None
+
+# ----------------- MAIN: interactive run -----------------
+user_key = input("Enter Symbol (NSE / BSE Code / Screener Slug): ").upper().strip()
+resolved_key, ok = resolve_company_key(user_key)
+
+if not ok:
+    print("❌ Company not found on Screener. Try NSE symbol, BSE code, or Screener slug.")
+else:
+    print(f"✅ Resolved Key: {resolved_key}  — extracting...")
+    data = extract_everything(resolved_key)
+
+    # Print summary
+    print("\n📌 COMPANY NAME:", data["summary"]["company_name"])
+    display(pd.DataFrame([data["summary"]]))
+
+    print("\n📌 KEY POINTS:")
+    for x in data["key_points"]:
+        print("-", x)
+
+    print("\n📌 FLAT KEY-VALUE SAMPLE:")
+    for i,(k,v) in enumerate(list(data["flat_kv"].items())[:10]):
+        print(f"{k} -> {v}")
+
+    print("\n\n📌 ALL TABLES FOUND:")
+    total=0
+    for page, tbls in data["tables"].items():
+        print(f"\n=== PAGE: {page} ({len(tbls)} tables) ===")
+        total+=len(tbls)
+        for i,t in enumerate(tbls):
+            print(f"--- Table {i} Shape:{t.shape} ---")
+            display(t.head())
+    print("\nTOTAL TABLES:", total)
+
+    # ----------------- SCORING (use data extracted) -----------------
+    # summary fields
+    summary = data.get("summary", {})
+    market_cap = summary.get("market_cap")
+    current_price = summary.get("current_price")
+    high52 = summary.get("52w_high")
+    low52 = summary.get("52w_low")
+    pe = summary.get("stock_pe")
+    book_value = summary.get("book_value")
+    div_yield = summary.get("dividend_yield_pct")
+    roce = summary.get("roce_pct")
+    roe = summary.get("roe_pct")
+
+    # find values across all tables
+    borrowings_latest = search_all_tables_for(["Borrowings","Borrowings +","Total Borrowings"], data)
+    reserves_latest = search_all_tables_for(["Reserves","Reserves +"], data)
+    other_liab_latest = search_all_tables_for(["Other Liabilities","Other Liabilities +","Other Liabilities"], data)
+    equity_cap_latest = search_all_tables_for(["Equity Capital","Equity","Share Capital"], data)
+    cfo_latest = search_all_tables_for(["Cash from Operating Activity","Cash from Operating Activity +","Cash From Operations","Cash Flows from Operating Activities"], data)
+    net_cash_latest = search_all_tables_for(["Net Cash Flow","Net Cash Flow "], data)
+
+    inventory_days_latest = search_all_tables_for(["Inventory Days","Inventory Days "], data)
+    ccc_latest = search_all_tables_for(["Cash Conversion Cycle","Cash Conversion Cycle "], data)
+
+    promoter_latest = search_all_tables_for(["Promoters +","Promoters","Promoters %"], data)
+    fii_latest = search_all_tables_for(["FIIs +","FIIs","FII"], data)
+    dii_latest = search_all_tables_for(["DIIs +","DIIs","DII"], data)
+    public_latest = search_all_tables_for(["Public +","Public","Public %"], data)
+
+    # OPM quarters extraction
+    opm_quarters = None
+    for page, tbls in data["tables"].items():
+        for t in (tbls or []):
+            try:
+                df = pd.DataFrame(t)
+                first_col = df.columns[0]
+                labels = df[first_col].astype(str).tolist()
+                for i,label in enumerate(labels):
+                    if "opm" in str(label).lower():
+                        vals = df.iloc[i, 1:].tolist() if df.shape[1] > 1 else df.iloc[i,:].tolist()
+                        parsed=[]
+                        for v in vals[::-1]:
+                            vnum = to_float_safe(v)
+                            if vnum is not None:
+                                parsed.append(vnum)
+                                if len(parsed) >= 8: break
+                        if parsed:
+                            opm_quarters = parsed[::-1][-4:] if len(parsed) >=4 else parsed[::-1]
+                            break
+                if opm_quarters: break
+            except:
+                continue
+        if opm_quarters: break
+
+    # history detection
+    def infer_history_years(tables_dict):
+        years=[]
+        for page, tbls in tables_dict.items():
+            for t in (tbls or []):
+                cols = [str(c) for c in t.columns]
+                for c in cols:
+                    m = re.search(r"(19|20)\d{2}", c)
+                    if m:
+                        years.append(int(m.group(0)))
+        if years:
+            return max(years)-min(years)+1
+        return 0
+
+    history_years = infer_history_years(data.get("tables", {}))
+    HIST_FLAG = history_years < 3
+
+    # Compose rules R1..R23
+    rules = {}
+    rules['R1_marketcap_ge_20000cr'] = 1 if (market_cap is not None and market_cap >= 20000) else (0 if market_cap is not None else None)
+    rules['R2_pe_le_40'] = 1 if (pe is not None and pe <= 40) else (0 if pe is not None else None)
+    rules['R3_dividend_yield_ge_0_5'] = 1 if (div_yield is not None and div_yield >= 0.5) else (0 if div_yield is not None else None)
+    rules['R4_roe_ge_12'] = 1 if (roe is not None and roe >= 12) else (0 if roe is not None else None)
+    rules['R5_roce_ge_12'] = 1 if (roce is not None and roce >= 12) else (0 if roce is not None else None)
+    if current_price is not None and high52 is not None:
+        rules['R6_price_le_95pct_52w_high'] = 1 if current_price <= 0.95 * high52 else 0
+    else:
+        rules['R6_price_le_95pct_52w_high'] = None
+    if current_price is not None and low52 is not None:
+        rules['R7_price_ge_120pct_52w_low'] = 1 if current_price >= 1.20 * low52 else 0
+    else:
+        rules['R7_price_ge_120pct_52w_low'] = None
+
+    rules['R8_borrowings_le_0p6_reserves'] = None
+    if borrowings_latest is not None and reserves_latest is not None and reserves_latest != 0:
+        rules['R8_borrowings_le_0p6_reserves'] = 1 if borrowings_latest <= 0.6 * reserves_latest else 0
+    rules['R9_reserves_positive'] = 1 if (reserves_latest is not None and reserves_latest > 0) else (0 if reserves_latest is not None else None)
+    rules['R10_other_liab_le_2x_reserves'] = None
+    if other_liab_latest is not None and reserves_latest is not None and reserves_latest != 0:
+        rules['R10_other_liab_le_2x_reserves'] = 1 if other_liab_latest <= 2 * reserves_latest else 0
+    rules['R11_equity_cap_positive'] = 1 if (equity_cap_latest is not None and equity_cap_latest > 0) else (0 if equity_cap_latest is not None else None)
+
+    rules['R12_cfo_positive'] = 1 if (cfo_latest is not None and cfo_latest > 0) else (0 if cfo_latest is not None else None)
+    rules['R13_net_cash_positive'] = 1 if (net_cash_latest is not None and net_cash_latest >= 0) else (0 if net_cash_latest is not None else None)
+    rules['R14_cfo_quality'] = 1 if (cfo_latest is not None and cfo_latest > 0) else (0 if cfo_latest is not None else None)
+
+    rules['R15_inventory_days_lt_120'] = 1 if (inventory_days_latest is not None and inventory_days_latest < 120) else (0 if inventory_days_latest is not None else None)
+    rules['R16_ccc_lt_0'] = 1 if (ccc_latest is not None and ccc_latest < 0) else (0 if ccc_latest is not None else None)
+    rules['R17_abs_ccc_lt_90'] = 1 if (ccc_latest is not None and abs(ccc_latest) < 90) else (0 if ccc_latest is not None else None)
+
+    rules['R18_promoter_ge_50pct'] = 1 if (promoter_latest is not None and promoter_latest >= 50) else (0 if promoter_latest is not None else None)
+    rules['R19_fii_ge_10pct'] = 1 if (fii_latest is not None and fii_latest >= 10) else (0 if fii_latest is not None else None)
+    rules['R20_dii_ge_10pct'] = 1 if (dii_latest is not None and dii_latest >= 10) else (0 if dii_latest is not None else None)
+    rules['R21_public_le_30pct'] = 1 if (public_latest is not None and public_latest <= 30) else (0 if public_latest is not None else None)
+
+    rules['R22_book_value_positive'] = 1 if (book_value is not None and book_value > 0) else (0 if book_value is not None else None)
+
+    rules['R23_opm_std_lt_5pct_4q'] = None
+    if opm_quarters is not None and len(opm_quarters) >= 3:
+        rules['R23_opm_std_lt_5pct_4q'] = 1 if np.std(opm_quarters) < 5 else 0
+
+    # Aggregate
+    available_rules = [k for k,v in rules.items() if v is not None]
+    n_avail = len(available_rules)
+    n_good = sum(rules[k] for k in available_rules)
+    final_score = (n_good / max(1,n_avail)) * 25
+
+    if HIST_FLAG:
+        if history_years >= 2: alpha=0.20
+        elif history_years == 1: alpha=0.35
+        else: alpha=0.45
+        final_score = round(final_score * (1 - alpha),2)
+    else:
+        final_score = round(final_score,2)
+
+    def map_bucket(score, hist_flag):
+        if hist_flag:
+            if score >= 22: return "EXCELLENT"
+            if score >= 18: return "BEST"
+            if score >= 14: return "GOOD"
+            if score >= 10: return "AVERAGE"
+            return "POOR"
+        else:
+            if score >= 20: return "EXCELLENT"
+            if score >= 16: return "BEST"
+            if score >= 12: return "GOOD"
+            if score >= 8: return "AVERAGE"
+            return "POOR"
+
+    bucket = map_bucket(final_score, HIST_FLAG)
+    uncertainty = "HIGH" if HIST_FLAG or n_avail < 16 else "LOW"
+
+    result = {
+        "company": summary.get("company_name"),
+        "symbol": resolved_key,
+        "history_years": history_years,
+        "hist_flag": HIST_FLAG,
+        "n_rules_available": n_avail,
+        "n_rules_good": n_good,
+        "final_score_0_25": final_score,
+        "bucket": bucket,
+        "uncertainty": uncertainty,
+        "rules": rules,
+        "extracted_vals": {
+            "market_cap": market_cap, "current_price": current_price, "pe": pe,
+            "book_value": book_value, "dividend_yield": div_yield, "roce": roce, "roe": roe,
+            "borrowings_latest": borrowings_latest, "reserves_latest": reserves_latest,
+            "other_liab_latest": other_liab_latest, "equity_cap_latest": equity_cap_latest,
+            "cfo_latest": cfo_latest, "net_cash_latest": net_cash_latest,
+            "inventory_days_latest": inventory_days_latest, "ccc_latest": ccc_latest,
+            "promoter_latest": promoter_latest, "fii_latest": fii_latest, "dii_latest": dii_latest,
+            "public_latest": public_latest, "opm_quarters": opm_quarters
+        }
+    }
+
+    # Print concise summary
+    print("\n--- SCORING RESULT (improved extraction) ---")
+    print("Company:", result['company'], "| Symbol:", result['symbol'])
+    print("History years:", result['history_years'], "| HIST_FLAG:", result['hist_flag'])
+    print("Rules available:", result['n_rules_available'], "/ 23")
+    print("Good rules:", result['n_rules_good'])
+    print("Final score (0-25):", result['final_score_0_25'])
+    print("Bucket:", result['bucket'], "| Uncertainty:", result['uncertainty'])
+    print("\nPer-rule flags (None = missing):")
+    for k in sorted(rules.keys()):
+        print(k, "=", rules[k])
+
+    fname = f"{resolved_key}_scoring_result_improved.json"
+    with open(fname, "w") as f:
+        json.dump(result, f, indent=2, default=str)
+    print(f"\nSaved improved scoring result -> {fname}")
+
+    # ----------------- PERCENTAGE ANALYSIS & RANGE -----------------
+    def percentage_score(good_rules, total_rules):
+        if total_rules == 0:
+            return None, "No Rules"
+        percent = (good_rules / total_rules) * 100
+        if percent >= 90: grade = "EXCELLENT"
+        elif percent >= 80: grade = "GOOD"
+        elif percent >= 70: grade = "AVERAGE"
+        elif percent >= 60: grade = "WEAK"
+        else: grade = "POOR"
+        return round(percent,2), grade
+
+    percent, grade = percentage_score(result["n_rules_good"], result["n_rules_available"])
+    print("\n--- PERCENTAGE ANALYSIS ---")
+    print(f"Rule Score Percentage: {percent}%")
+    print(f"Rating by Percentage: {grade}")
+
+    print("\n--- SCORE RANGE TABLE ---")
+    print("90% - 100%  →  EXCELLENT")
+    print("80% -  90%  →  GOOD")
+    print("70% -  80%  →  AVERAGE")
+    print("60% -  70%  →  WEAK")
+    print("0%  -  60%  →  POOR")
+
+# End of block
