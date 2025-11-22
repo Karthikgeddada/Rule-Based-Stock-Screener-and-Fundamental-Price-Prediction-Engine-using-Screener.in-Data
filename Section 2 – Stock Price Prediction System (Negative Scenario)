@@ -1,0 +1,449 @@
+# ------------------ FINAL: LEVEL-1 NEGATIVE (DOWNSIDE) PREDICTION UI + Visualization ------------------
+# Paste this below your existing screener/extraction code and run.
+
+import math, datetime
+import matplotlib.pyplot as plt   # for line chart
+import pandas as pd
+import re
+
+def _get_compounded(data, kind="Sales", preferred_years=[5,3,10]):
+    """Try to extract compounded growth numbers from Screener 'Compounded ...' tables.
+       preferred_years = list of year spans we prefer in order (e.g. [5,3,10])."""
+    # search for small tables like "Compounded Sales Growth" or "Compounded Profit Growth"
+    label_candidates = [f"Compounded {kind} Growth", f"Compounded {kind}", f"{kind} CAGR", f"{kind} Growth"]
+    for lab in label_candidates:
+        v = search_all_tables_for([lab], data)
+        if v is not None:
+            return v
+    # fallback: try to parse the small table explicitly
+    try:
+        for page, tbls in data.get("tables", {}).items():
+            for t in (tbls or []):
+                try:
+                    df = pd.DataFrame(t)
+                    # first column header text sometimes includes "Compounded Sales Growth"
+                    first = str(df.columns[0]).lower()
+                    if "compounded" in first and kind.lower() in first:
+                        # second column contains values like "10 Years:", "5 Years:"
+                        for i in range(df.shape[0]):
+                            label = str(df.iloc[i,0]).lower()
+                            for y in preferred_years:
+                                if str(y) in label:
+                                    val = to_float_safe(df.iloc[i,1])
+                                    if val is not None:
+                                        return val
+                    # generic rows: check left column contains '10 years' and right column percentage
+                    rows = df.iloc[:,0].astype(str).tolist()
+                    for i, r in enumerate(rows):
+                        for y in preferred_years:
+                            if str(y) in r.lower() and ('%' in str(df.iloc[i,1]) or re.search(r'\d', str(df.iloc[i,1]))):
+                                v = to_float_safe(df.iloc[i,1])
+                                if v is not None:
+                                    return v
+                except:
+                    continue
+    except:
+        pass
+    return None
+
+def _safe_float(x, default=None):
+    try:
+        if x is None:
+            return default
+        return float(x)
+    except:
+        return default
+
+def compute_prediction_for(resolved_key, data, years=5):
+    """Core rule-based LEVEL-1 predictor using only Screener fundamentals + rules."""
+    summary = data.get("summary", {}) or {}
+
+    # ---------- current_price fallback (used for text + graph base) ----------
+    current_price = summary.get("current_price")
+
+    # Fallback 1: sometimes scraper may have stored at top-level
+    if current_price is None:
+        current_price = data.get("current_price")
+
+    # Fallback 2: search inside tables (valuation / snapshot table)
+    if current_price is None:
+        cp_alt = search_all_tables_for(
+            ["Current Price", "Current price", "CMP", "CMP ₹", "CMP (₹)", "Current market price"],
+            data
+        )
+        current_price = _safe_float(cp_alt)
+
+    # write back so rest of code sees it in summary
+    summary["current_price"] = current_price
+    data["summary"] = summary
+    # --------------------------------------------------------
+
+    market_cap = summary.get("market_cap")
+    roe = summary.get("roe_pct")
+    roce = summary.get("roce_pct")
+    book_value = summary.get("book_value")
+    pe = summary.get("stock_pe")
+
+    # history years / flags
+    history_years = infer_history_years(data.get("tables", {}))
+    HIST_FLAG = history_years < 3
+
+    # Extract compounded numbers (5y preferred, fallback 3y)
+    sales_5y = _get_compounded(data, kind="Sales", preferred_years=[5,3,10])
+    profit_5y = _get_compounded(data, kind="Profit", preferred_years=[5,3,10])
+
+    # If 5y NA, try TTM or 3yr
+    if sales_5y is None:
+        sales_5y = _get_compounded(data, kind="Sales", preferred_years=[3,5,10])
+    if profit_5y is None:
+        profit_5y = _get_compounded(data, kind="Profit", preferred_years=[3,5,10])
+
+    # fallback simple estimators
+    sales_5y = _safe_float(sales_5y)
+    profit_5y = _safe_float(profit_5y)
+
+    # base fundamental strength score (0-100) using your rules if present
+    rules_map = {}
+    if isinstance(data.get("scripts", None), list):
+        pass
+    if 'rules' in data:
+        rules_map = data['rules']
+    else:
+        rules_map = {}
+
+    # Build a simple "fundamental momentum" number from available values
+    components = []
+    if profit_5y is not None:
+        components.append(min(max(profit_5y, -100), 200))  # cap extremes
+    if sales_5y is not None:
+        components.append(min(max(sales_5y, -100), 200))
+    if roe is not None:
+        components.append(min(max(roe, -100), 200))
+    if roce is not None:
+        components.append(min(max(roce, -100), 200))
+
+    if components:
+        fund_strength = sum(components) / len(components)  # typical in % terms
+    else:
+        fund_strength = None
+
+    # Map fund_strength to baseline_growth_pct (annual)
+    baseline_growth = None
+    if fund_strength is not None:
+        baseline_growth = 0.06 + 0.01 * (fund_strength / 5.0)  # baseline in fractional (e.g. 0.08)
+        baseline_growth = max(-0.3, min(baseline_growth, 0.40))
+    else:
+        if profit_5y is not None:
+            baseline_growth = max(-0.3, min(profit_5y/100.0 * 0.85, 0.40))
+        elif sales_5y is not None:
+            baseline_growth = max(-0.3, min(sales_5y/100.0 * 0.6, 0.40))
+        else:
+            baseline_growth = 0.05  # neutral small growth
+
+    # If user requested short horizon, slightly bias toward recent profit growth; for long horizon lean on fundamentals
+    if years <= 2:
+        if profit_5y is not None:
+            baseline_growth = 0.5 * baseline_growth + 0.5 * (profit_5y/100.0)
+    elif years >= 7:
+        baseline_growth = baseline_growth * 0.9
+
+    # Adjust for market cap: smaller caps are more volatile -> widen band and lower confidence
+    mc_adj = 1.0
+    if market_cap is not None:
+        if market_cap < 500:
+            mc_adj = 0.6     # tiny microcap
+        elif market_cap < 2000:
+            mc_adj = 0.8     # smallcap
+        elif market_cap < 20000:
+            mc_adj = 0.95    # midcap
+        else:
+            mc_adj = 1.0
+
+    # Volatility proxy: use Cash Conversion Cycle and Inventory Days as risk proxies
+    ccc = search_all_tables_for(["Cash Conversion Cycle","Cash Conversion Cycle "], data)
+    inv_days = search_all_tables_for(["Inventory Days","Inventory Days "], data)
+    debtor_days = search_all_tables_for(["Debtor Days","Debtor days"], data)
+    risk_proxy = 0.0
+    for x in [ccc, inv_days, debtor_days]:
+        if x is not None:
+            risk_proxy += abs(x) / 365.0
+    risk_proxy = max(0.0, min(risk_proxy, 2.0))
+
+    # Build growth band width (in fractional terms)
+    width = 0.25  # default 25% around baseline for moderate certainty
+    if history_years < 3:
+        width = 0.60
+    elif history_years < 5:
+        width = 0.40
+    else:
+        width = 0.25
+
+    width = width + (1.0 - mc_adj) * 0.3 + min(risk_proxy * 0.15, 0.35)
+    width = max(0.15, min(width, 1.5))
+
+    # Construct CAGR low/high (base scenario band)
+    low_growth = baseline_growth * (1 - width)
+    high_growth = baseline_growth * (1 + width)
+
+    # clamps
+    low_growth = max(-0.6, min(low_growth, 0.5))
+    high_growth = max(-0.6, min(high_growth, 0.6))
+    if low_growth > high_growth:
+        low_growth, high_growth = high_growth, low_growth
+
+    # Trend label determination (simple)
+    trend = "Sideways"
+    mid = (low_growth + high_growth) / 2.0
+    if mid >= 0.12:
+        trend = "Strong Uptrend"
+    elif mid >= 0.05:
+        trend = "Uptrend"
+    elif mid >= -0.02:
+        trend = "Sideways"
+    elif mid >= -0.10:
+        trend = "Weak Downtrend"
+    else:
+        trend = "Downtrend"
+
+    # Confidence scoring [0-100]
+    conf = 50
+    if isinstance(data.get("tables", {}), dict):
+        n_tables = sum(len(v) for v in data.get("tables", {}).values())
+    else:
+        n_tables = 0
+
+    if history_years >= 10:
+        conf += 15
+    elif history_years >= 5:
+        conf += 8
+    elif history_years < 3:
+        conf -= 10
+
+    if fund_strength is not None and fund_strength >= 20:
+        conf += 10
+    if fund_strength is not None and fund_strength >= 40:
+        conf += 6
+
+    if market_cap is not None:
+        if market_cap >= 20000:
+            conf += 10
+        elif market_cap >= 2000:
+            conf += 5
+
+    conf -= int(risk_proxy * 8)
+    if mc_adj < 0.8:
+        conf -= 8
+    conf = max(10, min(conf, 95))
+
+    # Base price ranges for info (NOT used directly in negative graph)
+    if current_price is None:
+        price_low, price_high = None, None
+    else:
+        price_low = current_price * ((1 + low_growth) ** years)
+        price_high = current_price * ((1 + high_growth) ** years)
+
+    # Build explanation bullets
+    reasons = []
+    reasons.append(f"Computed baseline growth from fundamentals ~ {baseline_growth*100:.2f}% p.a.")
+    if profit_5y is not None:
+        reasons.append(f"Observed Profit CAGR (approx): {profit_5y:.2f}% (used as input)")
+    if sales_5y is not None:
+        reasons.append(f"Observed Sales CAGR (approx): {sales_5y:.2f}% (used as input)")
+    if roe is not None:
+        reasons.append(f"ROE (latest): {roe:.2f}%")
+    if roce is not None:
+        reasons.append(f"ROCE (latest): {roce:.2f}%")
+    if history_years:
+        reasons.append(f"Financial history length: {history_years} years (affects confidence)")
+    if market_cap is not None:
+        reasons.append(f"Market cap: ₹{market_cap:.2f} Cr (affects volatility and confidence)")
+    if risk_proxy > 0:
+        reasons.append(f"Operational risk proxy (CCC/inventory/debtors): {risk_proxy:.2f} (widened range)")
+
+    result = {
+        "symbol": resolved_key,
+        "company": summary.get("company_name"),
+        "years": years,
+        "current_price": current_price,
+        "baseline_growth_pct": baseline_growth * 100,
+        "cagr_low_pct": low_growth * 100,
+        "cagr_high_pct": high_growth * 100,
+        "trend": trend,
+        "price_low": price_low,
+        "price_high": price_high,
+        "confidence_pct": conf,
+        "history_years": history_years,
+        "notes": reasons
+    }
+    return result
+
+# ---------- NEGATIVE: Pessimistic / downside band built from base prediction ----------
+def compute_negative_prediction_for(resolved_key, data, years=5, extra_downside=0.15):
+    """
+    Build a pessimistic / downside scenario from the base prediction band.
+    extra_downside: how much additional negative tilt vs baseline (fraction, e.g. 0.15 = 15%).
+    """
+    base = compute_prediction_for(resolved_key, data, years=years)
+
+    baseline = (base.get("baseline_growth_pct") or 0.0) / 100.0
+    low = (base.get("cagr_low_pct") or 0.0) / 100.0
+    high = (base.get("cagr_high_pct") or 0.0) / 100.0
+
+    # Tilt mid more toward downside
+    neg_mid = min(baseline - extra_downside, (baseline + low) / 2.0)
+
+    base_span = abs(high - low)
+    if base_span <= 0:
+        base_span = 0.10  # fallback 10% span
+
+    # Make downside band wider and upside limited
+    width_neg = base_span * 0.8 + 0.05
+    neg_low = max(-0.70, neg_mid - width_neg)         # allow deeper downside
+    neg_high = min(0.08,  neg_mid + width_neg * 0.4)  # cap upside sharply
+
+    if neg_low > neg_high:
+        neg_low, neg_high = neg_high, neg_low
+
+    cp = base.get("current_price")
+    if cp is not None:
+        price_low = cp * ((1 + neg_low) ** years)
+        price_high = cp * ((1 + neg_high) ** years)
+    else:
+        price_low = price_high = None
+
+    # Slightly higher confidence because it's conservative
+    conf = base.get("confidence_pct", 50)
+    conf = max(10, min(conf + 5, 95))
+
+    # Trend label (more aggressive to downtrend)
+    if neg_mid <= -0.12:
+        trend = "Strong Downtrend (Pessimistic)"
+    elif neg_mid <= -0.05:
+        trend = "Downtrend (Pessimistic)"
+    elif neg_mid < 0:
+        trend = "Weak Downtrend / Sideways (Pessimistic)"
+    else:
+        trend = "Sideways (Pessimistic)"
+
+    notes = list(base.get("notes", []))
+    notes.insert(0, f"Pessimistic tilt: shifted baseline down by ~{extra_downside*100:.1f} pts and widened downside, capped upside.")
+
+    result = dict(base)
+    result.update({
+        "years": years,
+        "baseline_growth_pct": neg_mid * 100,
+        "cagr_low_pct": neg_low * 100,
+        "cagr_high_pct": neg_high * 100,
+        "price_low": price_low,
+        "price_high": price_high,
+        "trend": trend,
+        "confidence_pct": conf,
+        "notes": notes,
+    })
+    return result
+
+# ---------- Visualization helper for NEGATIVE scenario (base = share price) ----------
+def plot_negative_path(pred):
+    """
+    Plot only LOW and HIGH pessimistic scenario lines using the actual share price as base.
+    """
+    years = pred.get("years", 5)
+    current_price = pred.get("current_price")
+
+    if current_price is None:
+        print("⚠️ No current price available, cannot plot price-based graph.")
+        return
+
+    low_g = pred["cagr_low_pct"] / 100.0
+    high_g = pred["cagr_high_pct"] / 100.0
+
+    xs = list(range(0, years + 1))
+    base_value = float(current_price)
+
+    low_path = [base_value * ((1 + low_g) ** t) for t in xs]
+    high_path = [base_value * ((1 + high_g) ** t) for t in xs]
+
+    plt.figure()
+    plt.plot(xs, low_path,  label="Downside (low) scenario")
+    plt.plot(xs, high_path, label="Downside (less-bad) scenario")
+
+    plt.xlabel("Years from now")
+    plt.ylabel("Price (₹)")
+    plt.title(f"Pessimistic Price Projection – {pred.get('company', '')} ({pred.get('symbol', '')})")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+# ---------- Interaction: ask exchange, symbol, years for NEGATIVE scenario ----------
+def run_negative_prediction_ui():
+    print("Select Exchange:")
+    print("1 -> NSE")
+    print("2 -> BSE")
+    print("3 -> SME (use Screener slug)")
+    ex = input("Enter choice (1/2/3): ").strip()
+    if ex not in ("1","2","3"):
+        print("Invalid choice. Defaulting to NSE.")
+        ex = "1"
+    symbol = input("Enter Stock Symbol / Code / Screener Slug: ").strip()
+    try:
+        years = int(input("Enter prediction horizon in years (1-10): ").strip())
+    except:
+        years = 5
+    if years < 1:
+        years = 1
+    if years > 10:
+        years = 10
+
+    # convert input based on exchange choice if needed
+    user_key = symbol.strip()
+    if ex == "1":
+        user_key = user_key.upper()   # NSE
+    elif ex == "2":
+        user_key = user_key           # BSE code / text
+    else:
+        user_key = user_key           # SME slug
+
+    resolved_key, ok = resolve_company_key(user_key)
+    if not ok:
+        print("❌ Company not found on Screener. Try NSE symbol, BSE code, or Screener slug.")
+        return
+
+    print(f"✅ Resolved Key: {resolved_key} — extracting data (pessimistic view)...")
+    data = extract_everything(resolved_key)
+
+    # compute pessimistic prediction
+    pred = compute_negative_prediction_for(resolved_key, data, years=years)
+
+    # Print nicely
+    print("\n--- NEGATIVE / DOWNSIDE SCENARIO SUMMARY ---")
+    print(f"Company: {pred['company']}  |  Symbol: {pred['symbol']}")
+    print(f"Horizon: {pred['years']} year(s)")
+    print(f"Trend (pessimistic model): {pred['trend']}")
+    print(f"Expected annual CAGR (pessimistic): {pred['cagr_low_pct']:.2f}%  —  {pred['cagr_high_pct']:.2f}% p.a.")
+    if pred['current_price'] is not None:
+        print(f"Current price: ₹{pred['current_price']:.4g}")
+        if pred['price_low'] is not None:
+            print(f"Pessimistic price range after {pred['years']} year(s): "
+                  f"₹{pred['price_low']:.4g}  —  ₹{pred['price_high']:.4g}")
+    else:
+        print("Current price unavailable, cannot show numeric price range; using only growth band.")
+    print(f"Model confidence (pessimistic): {pred['confidence_pct']:.0f}%")
+
+    print("\nKey reasons / inputs (pessimistic view):")
+    for r in pred['notes'][:10]:
+        print(" -", r)
+
+    print("\n⚠️ Notes:")
+    print(" - This is a DOWNSIDE-FOCUSED, conservative forecast.")
+    print(" - Upside is deliberately capped; downside band is widened.")
+    print(" - This is NOT investment advice. Use as a risk / worst-case input only.")
+    
+    # show downside line chart using share price as base
+    try:
+        plot_negative_path(pred)
+    except Exception as e:
+        print("⚠️ Could not plot graph:", e)
+
+# Run NEGATIVE scenario UI
+run_negative_prediction_ui()
