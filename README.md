@@ -1,147 +1,96 @@
-# Rule-Based-Stock-Screener-and-Fundamental-Price-Prediction-Engine-using-Screener.in-Data
-This project was built to help students, busy working professionals, and practical investors understand stock fundamentals clearly without spending hours on financial analysis.
+# Rule-Based Stock Screener & Fundamental Price Prediction Engine  
+### Using Screener.in Data
 
-Section 1 – Screener Data Extractor & Rule-Based Scoring System
-Purpose:
+This project is built to help **students, busy working professionals, and practical investors** understand stock fundamentals clearly without spending hours on financial analysis.
 
-This part of the system automatically:
+The system uses **explainable, rule-based logic** instead of black-box AI, so every output is transparent and easy to understand.
 
-Fetches financial data from Screener.in
+> ⚠️ This is a **learning and research project**.  
+> It is **not financial advice**.
 
-Cleans raw data
+---
 
-Evaluates stocks using 23 transparent financial rules
+## 🔹 Section 1 – Screener Data Extractor & Rule-Based Scoring System
 
-How It Works:
+### Purpose
+This module automatically:
 
-User enters:
+- Fetches financial data from **Screener.in**
+- Cleans and structures raw data
+- Evaluates stocks using **23 transparent financial rules**
 
-NSE / BSE / SME stock code
+### How It Works
 
-The system then:
+User inputs:
+- NSE / BSE / SME stock symbol
 
-Extracts:
+The system extracts key data such as:
 
-Market Cap
+- Market Cap  
+- ROE, ROCE  
+- P/E Ratio  
+- Borrowings  
+- Reserves  
+- Promoter Holding  
+- Debt and Cash Flow  
 
-ROE, ROCE
+Then applies rules like:
 
-P/E Ratio
+| Rule | Logic |
+|------|--------|
+| Market Cap ≥ ₹20,000 Cr | Company stability |
+| ROE ≥ 12% | Profit efficiency |
+| Low Debt | Financial safety |
+| Strong Cash Flow | Business health |
 
-Borrowings
+Each rule returns:
 
-Reserves
+- `1` → Passed  
+- `0` → Failed  
+- `None` → Data not available  
 
-Promoter holding
+### Output
 
-Debt, Cash Flow, etc.
+The system calculates:
 
-Applies rules like:
+- Final Score (0–25)
+- Score Percentage
+- Category:
+  - Excellent
+  - Best
+  - Good
+  - Average
+  - Poor
 
-Rule	Logic
-Market Cap ≥ ₹20,000 Cr	Company stability
-ROE ≥ 12%	Profit efficiency
-Low Debt	Financial safety
-Strong Cash Flow	Business health
+This helps users **quickly filter fundamentally strong stocks**.
 
-Each rule gives:
+---
 
-1 if passed
+## 🔹 Section 2 – Fundamental Price Prediction System (Positive Scenario)
 
-0 if failed
+### Purpose
+This module generates **realistic future price ranges** instead of fake exact predictions.
 
-None if data missing
+It calculates:
 
-Finally, the system calculates:
+- Minimum expected growth  
+- Maximum expected growth  
+- Confidence level  
+- Trend (Uptrend / Sideways / Weak Downtrend)
 
-Final Score (0–25)
+### How It Works
 
-Percentage Score
+Uses financial inputs:
 
-Category:
+- Sales Growth  
+- Profit Growth  
+- ROE  
+- ROCE  
+- Market Cap  
+- Risk indicators:
+  - Cash Conversion Cycle  
+  - Inventory Days  
+  - Debtor Days  
 
-Excellent
+### Prediction Formula Used
 
-Best
-
-Good
-
-Average
-
-Poor
-
-This helps users quickly filter quality stocks.
-
-4. Section 2 – Stock Price Prediction System (Positive Scenario)
-Purpose:
-
-This section gives a realistic future price range.
-
-Instead of fake “exact predictions”, it calculates:
-
-✅ Minimum possible growth
-✅ Maximum possible growth
-✅ Confidence level
-✅ Future trend (Uptrend / Sideways / Weak Downtrend)
-
-How It Works:
-
-The system uses:
-
-Sales Growth
-
-Profit Growth
-
-ROE
-
-ROCE
-
-Market Cap
-
-Risk factors like:
-
-Cash Conversion Cycle
-
-Inventory Days
-
-Debtor Days
-
-Then it calculates:
-
-Output
-Expected CAGR (Low – High)
-Future Price Range
-Confidence %
-Visual Line Graph
-
-Example logic:
-
-Price after 5 years = Current Price × (1 + Growth Rate) ^ Years
-
-
-This does not promise profit.
-It shows a realistic range.
-
-5. Section 3 – Negative / Downside Prediction System
-Purpose:
-
-To protect users from over-confidence.
-
-Most systems show only “best case”.
-This section shows worst-case scenarios.
-
-What It Does:
-
-Reduces baseline growth
-
-Expands downside range
-
-Caps upside growth
-
-This teaches users:
-
-✅ Risk management
-✅ Worst-case planning
-✅ Capital protection mindset
-
-It also plots a separate downside graph based on actual stock price.
